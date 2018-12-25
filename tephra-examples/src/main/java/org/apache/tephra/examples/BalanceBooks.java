@@ -57,6 +57,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Random;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Simple example application that launches a number of concurrent clients, one per "account".  Each client attempts to
@@ -124,17 +125,26 @@ public class BalanceBooks implements Closeable {
    * Runs all clients and waits for them to complete.
    */
   public void run() throws IOException, InterruptedException {
+    final AtomicBoolean shouldStop = new AtomicBoolean(false);
     List<Client> clients = new ArrayList<>(totalClients);
     for (int i = 0; i < totalClients; i++) {
-      Client c = new Client(i, totalClients, iterations);
+      Client c = new Client(i, totalClients, iterations, shouldStop);
       c.init(txClient, conn.getTable(TABLE));
       c.start();
       clients.add(c);
     }
 
-    for (Client c : clients) {
-      c.join();
-      Closeables.closeQuietly(c);
+    Banker banker = new Banker(shouldStop);
+    banker.start();
+
+    try {
+      for (Client c : clients) {
+        c.join();
+        Closeables.closeQuietly(c);
+      }
+    } finally {
+      LOG.info("stopping");
+      shouldStop.set(true);
     }
   }
 
@@ -168,11 +178,12 @@ public class BalanceBooks implements Closeable {
         LOG.info("PASSED!");
         success = true;
       } else {
-        LOG.info("FAILED! Total balance should be 0 but was {}", totalBalance);
+        LOG.info("\u001b[31m" + "FAILED! Total balance should be 0 but was {}" + "\u001b[0m", totalBalance);
       }
       context.finish();
     } catch (Exception e) {
       LOG.error("Failed verification check", e);
+      return verify();
     }
     return success;
   }
@@ -195,6 +206,10 @@ public class BalanceBooks implements Closeable {
   protected void createTableIfNotExists(Configuration conf, byte[] tableName, byte[][] columnFamilies)
       throws IOException {
     try (HBaseAdmin admin = new HBaseAdmin(conf)) {
+      if (admin.tableExists(TableName.valueOf(tableName))) {
+        admin.disableTable(TableName.valueOf(tableName));
+        admin.deleteTable(TableName.valueOf(tableName));
+      }
       HTableDescriptor desc = new HTableDescriptor(TableName.valueOf(tableName));
       for (byte[] family : columnFamilies) {
         HColumnDescriptor columnDesc = new HColumnDescriptor(family);
@@ -243,6 +258,7 @@ public class BalanceBooks implements Closeable {
     private final int id;
     private final int totalClients;
     private final int iterations;
+    private final AtomicBoolean shouldStop;
 
     private final Random random = new Random();
 
@@ -250,10 +266,11 @@ public class BalanceBooks implements Closeable {
     private TransactionAwareHTable txTable;
 
 
-    public Client(int id, int totalClients, int iterations) {
+    public Client(int id, int totalClients, int iterations, AtomicBoolean shouldStop) {
       this.id = id;
       this.totalClients = totalClients;
       this.iterations = iterations;
+      this.shouldStop = shouldStop;
     }
 
     /**
@@ -270,7 +287,9 @@ public class BalanceBooks implements Closeable {
     public void run() {
       try {
         for (int i = 0; i < iterations; i++) {
-          runOnce();
+          if (!shouldStop.get()) {
+            runOnce();
+          }
         }
       } catch (TransactionFailureException e) {
         LOG.error("Client #{}: Failed on exception", id, e);
@@ -336,6 +355,29 @@ public class BalanceBooks implements Closeable {
 
     public void close() throws IOException {
       txTable.close();
+    }
+  }
+
+  private class Banker extends Thread {
+    private final AtomicBoolean shouldStop;
+
+    Banker(AtomicBoolean shouldStop) {
+      this.shouldStop = shouldStop;
+    }
+
+    public void run() {
+      try {
+        while (!shouldStop.get()) {
+          if (verify()) {
+            Thread.sleep(1000);
+          } else {
+            shouldStop.set(true);
+          }
+        }
+      } catch (InterruptedException | RuntimeException e) {
+        LOG.error("Banker failed. Stopping", e);
+        shouldStop.set(true);
+      }
     }
   }
 }
